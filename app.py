@@ -18,6 +18,7 @@ AT_USERNAME = os.environ.get("AT_USERNAME", "sandbox")   # 'sandbox' for testing
 AT_API_KEY = os.environ.get("AT_API_KEY", "")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:5000")  # set to real Render URL once deployed
 FEE_PER_ORDER = 50  # KSh you charge the seller per confirmed order
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "changeme")  # protects admin dashboard, daily-summary trigger, and product edits
 
 # One entry per seller. Add more as other shops go live.
 SELLERS = {
@@ -26,6 +27,18 @@ SELLERS = {
         "phone": os.environ.get("PRIME_WEAR_PHONE", "+2547XXXXXXXX"),  # placeholder until he confirms his number
         "report_token": os.environ.get("PRIME_WEAR_REPORT_TOKEN", "changeme-prime-report"),  # secret link token for his own sales report
     },
+}
+
+# Fixed category options per seller — the admin panel can only pick from this list,
+# so a product can never land somewhere that doesn't exist on the shop.
+CATEGORY_OPTIONS = {
+    "prime-wear": [
+        {"id": "sneakers", "label": "Sneakers"},
+        {"id": "official", "label": "Official Wear"},
+        {"id": "boots", "label": "Boots"},
+        {"id": "sandals", "label": "Sandals & Slides"},
+        {"id": "kids", "label": "Kids"},
+    ],
 }
 
 sms = None
@@ -67,6 +80,23 @@ def init_db():
     """)
     # Safe to run every startup — adds the column only if an older table doesn't have it yet.
     cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS reported BOOLEAN DEFAULT FALSE")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id TEXT PRIMARY KEY,
+            seller TEXT NOT NULL,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            price INTEGER NOT NULL,
+            sizes TEXT,
+            colors TEXT,
+            description TEXT,
+            photo_url TEXT,
+            in_stock BOOLEAN DEFAULT TRUE,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    """)
     conn.commit()
     cur.close()
     conn.close()
@@ -238,7 +268,119 @@ def order_status(order_id):
     return jsonify({"status": row["status"], "confirmed_at": row["confirmed_at"]})
 
 
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "changeme")
+# ---------- Products (Stage 1 — no admin UI yet, just the API it will talk to) ----------
+def check_admin(req):
+    """Accepts the secret either as ?secret= or an X-Admin-Secret header."""
+    supplied = req.args.get("secret") or req.headers.get("X-Admin-Secret")
+    return supplied == ADMIN_SECRET
+
+@app.route("/api/categories/<seller_id>")
+def get_categories(seller_id):
+    if seller_id not in SELLERS:
+        return jsonify({"error": "unknown seller"}), 404
+    return jsonify(CATEGORY_OPTIONS.get(seller_id, []))
+
+@app.route("/api/products/<seller_id>", methods=["GET", "POST", "OPTIONS"])
+def products_collection(seller_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    if seller_id not in SELLERS:
+        return jsonify({"error": "unknown seller"}), 404
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    if request.method == "GET":
+        cur.execute("SELECT * FROM products WHERE seller=%s ORDER BY category, name", (seller_id,))
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+        for r in rows:
+            r["sizes"] = [s for s in (r["sizes"] or "").split(",") if s]
+            r["colors"] = [c for c in (r["colors"] or "").split(",") if c]
+        return jsonify(rows)
+
+    # POST — create a new product. Admin-only.
+    if not check_admin(request):
+        cur.close(); conn.close()
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    name = (data.get("name") or "").strip()
+    category = data.get("category")
+    price = data.get("price")
+    sizes = data.get("sizes", [])
+    colors = data.get("colors", [])
+    description = data.get("description", "")
+    photo_url = data.get("photo_url", "")
+    in_stock = bool(data.get("in_stock", True))
+
+    valid_categories = [c["id"] for c in CATEGORY_OPTIONS.get(seller_id, [])]
+    if not name or not price:
+        cur.close(); conn.close()
+        return jsonify({"error": "name and price are required"}), 400
+    if category not in valid_categories:
+        cur.close(); conn.close()
+        return jsonify({"error": f"category must be one of {valid_categories}"}), 400
+
+    product_id = uuid.uuid4().hex[:10]
+    now = datetime.now(timezone.utc).isoformat()
+    cur.execute(
+        "INSERT INTO products (id, seller, name, category, price, sizes, colors, description, photo_url, in_stock, created_at, updated_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (product_id, seller_id, name, category, price, ",".join(sizes), ",".join(colors),
+         description, photo_url, in_stock, now, now)
+    )
+    conn.commit()
+    cur.close(); conn.close()
+    return jsonify({"id": product_id, "status": "created"})
+
+@app.route("/api/products/<seller_id>/<product_id>", methods=["PUT", "DELETE", "OPTIONS"])
+def products_item(seller_id, product_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    if seller_id not in SELLERS:
+        return jsonify({"error": "unknown seller"}), 404
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    if request.method == "DELETE":
+        cur.execute("DELETE FROM products WHERE id=%s AND seller=%s", (product_id, seller_id))
+        conn.commit()
+        cur.close(); conn.close()
+        return jsonify({"status": "deleted"})
+
+    # PUT — update an existing product
+    data = request.get_json(force=True, silent=True) or {}
+    valid_categories = [c["id"] for c in CATEGORY_OPTIONS.get(seller_id, [])]
+    category = data.get("category")
+    if category is not None and category not in valid_categories:
+        cur.close(); conn.close()
+        return jsonify({"error": f"category must be one of {valid_categories}"}), 400
+
+    fields, values = [], []
+    for key in ["name", "category", "price", "description", "photo_url", "in_stock"]:
+        if key in data:
+            fields.append(f"{key}=%s")
+            values.append(data[key])
+    if "sizes" in data:
+        fields.append("sizes=%s"); values.append(",".join(data["sizes"]))
+    if "colors" in data:
+        fields.append("colors=%s"); values.append(",".join(data["colors"]))
+    fields.append("updated_at=%s"); values.append(datetime.now(timezone.utc).isoformat())
+
+    if not fields:
+        cur.close(); conn.close()
+        return jsonify({"error": "nothing to update"}), 400
+
+    values.extend([product_id, seller_id])
+    cur.execute(f"UPDATE products SET {', '.join(fields)} WHERE id=%s AND seller=%s", values)
+    conn.commit()
+    cur.close(); conn.close()
+    return jsonify({"status": "updated"})
+
 
 @app.route("/admin/<secret>")
 def admin_dashboard(secret):
