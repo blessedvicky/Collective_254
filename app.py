@@ -81,8 +81,10 @@ def send_confirm_sms(order_id, seller_id, buyer_name, amount):
         return False, "no API key configured"
     try:
         response = client.send(message, [seller["phone"]])
+        print(f"[SMS attempt - confirm] to {seller['phone']}: {response}")
         return True, response
     except Exception as e:
+        print(f"[SMS failed - confirm] to {seller['phone']}: {e}")
         return False, str(e)
 
 def send_summary_sms(seller_id, order_count, total_amount):
@@ -100,8 +102,10 @@ def send_summary_sms(seller_id, order_count, total_amount):
         return False, "no API key configured"
     try:
         response = client.send(message, [seller["phone"]])
+        print(f"[SMS attempt - summary] to {seller['phone']}: {response}")
         return True, response
     except Exception as e:
+        print(f"[SMS failed - summary] to {seller['phone']}: {e}")
         return False, str(e)
 
 
