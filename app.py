@@ -60,9 +60,12 @@ def init_db():
             amount INTEGER,
             status TEXT DEFAULT 'pending',
             created_at TEXT,
-            confirmed_at TEXT
+            confirmed_at TEXT,
+            reported BOOLEAN DEFAULT FALSE
         )
     """)
+    # Safe to run every startup — adds the column only if an older table doesn't have it yet.
+    cur.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS reported BOOLEAN DEFAULT FALSE")
     conn.commit()
     cur.close()
     conn.close()
@@ -163,12 +166,17 @@ CONFIRM_PAGE = """
 <title>Confirm Payment</title>
 <style>
   body{font-family:sans-serif; background:#F6F0E4; color:#211B16; padding:30px 20px; text-align:center;}
-  .box{max-width:360px; margin:40px auto; background:#fff; border-radius:12px; padding:28px 22px; box-shadow:0 8px 20px rgba(0,0,0,0.1);}
-  h2{margin-bottom:14px;}
-  p{margin-bottom:20px; color:#5c4f43;}
-  button{background:#3f7a4d; color:#fff; border:none; padding:14px 26px; border-radius:8px; font-weight:700; font-size:1rem;}
-  .done{color:#3f7a4d; font-weight:700; font-size:1.1rem;}
-  .already{color:#8a7d6f;}
+  .box{max-width:380px; margin:40px auto; background:#fff; border-radius:12px; padding:28px 22px; box-shadow:0 8px 20px rgba(0,0,0,0.1); text-align:left;}
+  h2{margin-bottom:14px; text-align:center;}
+  p{margin-bottom:12px; color:#5c4f43;}
+  .amount{font-size:1.3rem; font-weight:800; text-align:center; margin-bottom:18px;}
+  .detail-row{display:flex; justify-content:space-between; font-size:0.9rem; padding:6px 0; border-bottom:1px solid #eee;}
+  .detail-row span:first-child{color:#8a7d6f;}
+  .items-box{background:#F6F0E4; border-radius:8px; padding:10px 12px; margin:14px 0;}
+  .item-line{font-size:0.88rem; padding:4px 0;}
+  button{background:#3f7a4d; color:#fff; border:none; padding:14px 26px; border-radius:8px; font-weight:700; font-size:1rem; width:100%; margin-top:16px;}
+  .done{color:#3f7a4d; font-weight:700; font-size:1.1rem; text-align:center;}
+  .already{color:#8a7d6f; text-align:center;}
 </style></head><body>
 <div class="box">
 {% if already %}
@@ -177,7 +185,15 @@ CONFIRM_PAGE = """
   <p class="already">Order not found.</p>
 {% else %}
   <h2>Confirm Payment</h2>
-  <p>KSh {{ amount }} from {{ buyer_name }}</p>
+  <div class="amount">KSh {{ amount }}</div>
+  <div class="detail-row"><span>Buyer</span><span>{{ buyer_name }}</span></div>
+  <div class="detail-row"><span>Phone</span><span>{{ phone }}</span></div>
+  <div class="detail-row"><span>Area</span><span>{{ area }}</span></div>
+  <div class="items-box">
+    {% for item in items %}
+    <div class="item-line">{{ item.qty }}x {{ item.name }}{% if item.size %} — size {{ item.size }}{% endif %}{% if item.color %} — {{ item.color }}{% endif %}</div>
+    {% endfor %}
+  </div>
   <form method="POST">
     <button type="submit">Yes, I received this payment</button>
   </form>
@@ -221,7 +237,21 @@ def confirm_order(order_id):
     if row["status"] == "confirmed":
         return render_template_string(CONFIRM_PAGE, already=True, not_found=False, confirmed_at=row["confirmed_at"])
     return render_template_string(CONFIRM_PAGE, already=False, not_found=False,
-                                   amount=row["amount"], buyer_name=row["buyer_name"])
+                                   amount=row["amount"], buyer_name=row["buyer_name"],
+                                   phone=row["phone"], area=row["area"],
+                                   items=json.loads(row["items_json"] or "[]"))
+
+
+@app.route("/api/order-status/<order_id>")
+def order_status(order_id):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT status, confirmed_at FROM orders WHERE id = %s", (order_id,))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    if not row:
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"status": row["status"], "confirmed_at": row["confirmed_at"]})
 
 
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "changeme")
@@ -254,6 +284,35 @@ def admin_dashboard(secret):
     lines.append("</table>")
 
     return "<html><body style='font-family:sans-serif;padding:20px;'>" + "".join(lines) + "</body></html>"
+
+
+@app.route("/internal/daily-summary/<secret>", methods=["POST", "GET"])
+def daily_summary(secret):
+    if secret != ADMIN_SECRET:
+        return "Not found", 404
+
+    conn = get_db()
+    cur = conn.cursor()
+    results = {}
+    for seller_id in SELLERS:
+        cur.execute(
+            "SELECT id, amount FROM orders WHERE seller=%s AND status='confirmed' AND reported=FALSE",
+            (seller_id,)
+        )
+        rows = cur.fetchall()
+        if not rows:
+            results[seller_id] = {"orders": 0, "sent": False}
+            continue
+        count = len(rows)
+        total = sum(r["amount"] for r in rows)
+        sent, info = send_summary_sms(seller_id, count, total)
+        if sent:
+            ids = tuple(r["id"] for r in rows)
+            cur.execute("UPDATE orders SET reported=TRUE WHERE id IN %s", (ids,))
+            conn.commit()
+        results[seller_id] = {"orders": count, "total": total, "fee": count * FEE_PER_ORDER, "sent": sent}
+    cur.close(); conn.close()
+    return jsonify(results)
 
 
 if __name__ == "__main__":
