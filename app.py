@@ -24,6 +24,7 @@ SELLERS = {
     "prime-wear": {
         "name": "Prime Wear Collections 254",
         "phone": os.environ.get("PRIME_WEAR_PHONE", "+2547XXXXXXXX"),  # placeholder until he confirms his number
+        "report_token": os.environ.get("PRIME_WEAR_REPORT_TOKEN", "changeme-prime-report"),  # secret link token for his own sales report
     },
 }
 
@@ -73,42 +74,25 @@ def init_db():
 
 # ---------- SMS ----------
 def send_confirm_sms(order_id, seller_id, buyer_name, amount):
-    seller = SELLERS.get(seller_id)
-    if not seller:
-        return False, "unknown seller"
     link = f"{BASE_URL}/confirm/{order_id}"
     message = f"New order: KSh {amount} from {buyer_name}. Tap to confirm you received payment: {link}"
-    client = get_sms_client()
-    if not client:
-        print(f"[SMS skipped - no API key set] Would send to {seller['phone']}: {message}")
-        return False, "no API key configured"
-    try:
-        response = client.send(message, [seller["phone"]])
-        print(f"[SMS attempt - confirm] to {seller['phone']}: {response}")
-        return True, response
-    except Exception as e:
-        print(f"[SMS failed - confirm] to {seller['phone']}: {e}")
-        return False, str(e)
+    return send_sms(seller_id, message)
 
-def send_summary_sms(seller_id, order_count, total_amount):
+def send_sms(seller_id, message):
+    """Generic sender — used for the confirm-link SMS and the daily report-link SMS."""
     seller = SELLERS.get(seller_id)
     if not seller:
         return False, "unknown seller"
-    fee_owed = order_count * FEE_PER_ORDER
-    message = (
-        f"Today's sales: {order_count} confirmed order(s), KSh {total_amount} total. "
-        f"Collective 254 fee owed: KSh {fee_owed}."
-    )
     client = get_sms_client()
     if not client:
         print(f"[SMS skipped - no API key set] Would send to {seller['phone']}: {message}")
         return False, "no API key configured"
     try:
         response = client.send(message, [seller["phone"]])
-        print(f"[SMS attempt - summary] to {seller['phone']}: {response}")
+        print(f"[SMS attempt] to {seller['phone']}: {response}")
         return True, response
     except Exception as e:
-        print(f"[SMS failed - summary] to {seller['phone']}: {e}")
+        print(f"[SMS failed] to {seller['phone']}: {e}")
         return False, str(e)
 
 
@@ -294,7 +278,7 @@ def daily_summary(secret):
     conn = get_db()
     cur = conn.cursor()
     results = {}
-    for seller_id in SELLERS:
+    for seller_id, seller in SELLERS.items():
         cur.execute(
             "SELECT id, amount FROM orders WHERE seller=%s AND status='confirmed' AND reported=FALSE",
             (seller_id,)
@@ -305,14 +289,137 @@ def daily_summary(secret):
             continue
         count = len(rows)
         total = sum(r["amount"] for r in rows)
-        sent, info = send_summary_sms(seller_id, count, total)
+        fee = count * FEE_PER_ORDER
+        ids = [r["id"] for r in rows]
+
+        report_link = f"{BASE_URL}/report/{seller_id}/{seller['report_token']}?ids={','.join(ids)}"
+        message = (
+            f"Today's sales are ready: {count} order(s), KSh {total} total. "
+            f"View full details and what you owe Blessed Victor: {report_link}"
+        )
+        sent, info = send_sms(seller_id, message)
         if sent:
-            ids = tuple(r["id"] for r in rows)
-            cur.execute("UPDATE orders SET reported=TRUE WHERE id IN %s", (ids,))
+            cur.execute("UPDATE orders SET reported=TRUE WHERE id = ANY(%s)", (ids,))
             conn.commit()
-        results[seller_id] = {"orders": count, "total": total, "fee": count * FEE_PER_ORDER, "sent": sent}
+        results[seller_id] = {"orders": count, "total": total, "fee": fee, "sent": sent, "report_link": report_link}
     cur.close(); conn.close()
     return jsonify(results)
+
+
+REPORT_PAGE = """
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sales Report — {{ seller_name }}</title>
+<style>
+  :root{ --espresso:#2A1B12; --rust:#B5451F; --rust-dark:#8F3517; --gold:#C89B4A; --cream:#EDE3D0; --cream-2:#F6F0E4; --green:#3f7a4d; }
+  *{box-sizing:border-box;}
+  body{font-family:sans-serif; background:var(--cream-2); color:var(--espresso); margin:0; padding:0 0 40px;}
+  .hero{background:linear-gradient(180deg,var(--espresso),#241609); color:var(--cream); padding:36px 20px 30px; text-align:center;}
+  .hero .eyebrow{color:var(--gold); font-weight:700; font-size:0.75rem; letter-spacing:0.08em; text-transform:uppercase; margin-bottom:8px;}
+  .hero h1{font-size:1.4rem; margin-bottom:4px;}
+  .hero .date{color:rgba(237,227,208,0.7); font-size:0.85rem;}
+  .wrap{max-width:480px; margin:0 auto; padding:0 18px;}
+  .stat-row{display:flex; gap:12px; margin:-22px 0 24px;}
+  .stat-card{flex:1; background:#fff; border-radius:12px; padding:16px 14px; text-align:center; box-shadow:0 8px 20px rgba(42,27,18,0.12);}
+  .stat-card .num{font-size:1.4rem; font-weight:800; color:var(--rust-dark);}
+  .stat-card .label{font-size:0.72rem; color:#8a7d6f; margin-top:2px;}
+  .owe-box{background:var(--rust); color:#fff; border-radius:12px; padding:18px 20px; margin-bottom:26px; box-shadow:0 10px 22px rgba(181,69,31,0.3);}
+  .owe-box .owe-label{font-size:0.8rem; opacity:0.9; margin-bottom:4px;}
+  .owe-box .owe-amount{font-size:1.6rem; font-weight:800;}
+  .owe-box .owe-note{font-size:0.75rem; opacity:0.85; margin-top:6px;}
+  h2{font-size:1.05rem; margin:0 0 12px;}
+  .section{margin-bottom:28px;}
+  .sold-item{background:#fff; border-radius:8px; padding:11px 14px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center; box-shadow:0 4px 10px rgba(42,27,18,0.06);}
+  .sold-item .name{font-size:0.9rem; font-weight:600;}
+  .sold-item .meta{font-size:0.76rem; color:#8a7d6f;}
+  .sold-item .qty{background:var(--gold); color:var(--espresso); font-weight:800; font-size:0.85rem; padding:4px 10px; border-radius:999px;}
+  .order-row{background:#fff; border-radius:8px; padding:11px 14px; margin-bottom:8px; box-shadow:0 4px 10px rgba(42,27,18,0.06);}
+  .order-row .top{display:flex; justify-content:space-between; font-size:0.88rem; font-weight:700;}
+  .order-row .sub{font-size:0.76rem; color:#8a7d6f; margin-top:3px;}
+  .empty{color:#8a7d6f; font-size:0.85rem; text-align:center; padding:20px;}
+</style></head><body>
+<div class="hero">
+  <div class="eyebrow">Collective 254</div>
+  <h1>{{ seller_name }}'s Sales Report</h1>
+  <div class="date">Generated {{ generated_at }}</div>
+</div>
+<div class="wrap">
+  <div class="stat-row">
+    <div class="stat-card"><div class="num">{{ order_count }}</div><div class="label">Orders</div></div>
+    <div class="stat-card"><div class="num">KSh {{ total_sales }}</div><div class="label">Total sales</div></div>
+  </div>
+
+  <div class="owe-box">
+    <div class="owe-label">You owe Blessed Victor (Collective 254 fee)</div>
+    <div class="owe-amount">KSh {{ fee_owed }}</div>
+    <div class="owe-note">KSh {{ fee_per_order }} × {{ order_count }} confirmed order(s)</div>
+  </div>
+
+  <div class="section">
+    <h2>What sold — for restocking</h2>
+    {% if sold_items|length == 0 %}<div class="empty">Nothing in this batch.</div>{% endif %}
+    {% for item in sold_items %}
+    <div class="sold-item">
+      <div><div class="name">{{ item.name }}</div><div class="meta">{% if item.size %}Size {{ item.size }}{% endif %}{% if item.color %} · {{ item.color }}{% endif %}</div></div>
+      <div class="qty">{{ item.qty }}</div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="section">
+    <h2>Orders in this batch</h2>
+    {% for o in orders %}
+    <div class="order-row">
+      <div class="top"><span>{{ o.buyer_name }}</span><span>KSh {{ o.amount }}</span></div>
+      <div class="sub">{{ o.phone }} · {{ o.area }} · confirmed {{ o.confirmed_at }}</div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+</body></html>
+"""
+
+@app.route("/report/<seller_id>/<token>")
+def daily_report(seller_id, token):
+    seller = SELLERS.get(seller_id)
+    if not seller or token != seller.get("report_token"):
+        return "Not found", 404
+
+    ids_param = request.args.get("ids", "")
+    ids = [i for i in ids_param.split(",") if i]
+    if not ids:
+        return "No orders specified in this report link.", 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM orders WHERE id = ANY(%s) AND seller=%s", (ids, seller_id))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    order_count = len(rows)
+    total_sales = sum(r["amount"] for r in rows)
+    fee_owed = order_count * FEE_PER_ORDER
+
+    sold_agg = {}
+    for r in rows:
+        for item in json.loads(r["items_json"] or "[]"):
+            key = (item.get("name"), item.get("size"), item.get("color"))
+            if key not in sold_agg:
+                sold_agg[key] = {"name": item.get("name"), "size": item.get("size"), "color": item.get("color"), "qty": 0}
+            sold_agg[key]["qty"] += item.get("qty", 1)
+    sold_items = sorted(sold_agg.values(), key=lambda x: -x["qty"])
+
+    return render_template_string(
+        REPORT_PAGE,
+        seller_name=seller["name"],
+        generated_at=datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC"),
+        order_count=order_count,
+        total_sales=total_sales,
+        fee_owed=fee_owed,
+        fee_per_order=FEE_PER_ORDER,
+        sold_items=sold_items,
+        orders=rows,
+    )
 
 
 if __name__ == "__main__":
