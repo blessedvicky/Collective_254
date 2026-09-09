@@ -1,13 +1,16 @@
 import os
-import sqlite3
 import uuid
 import json
+import psycopg2
+import psycopg2.extras
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "orders.db")
+# Supabase (or any Postgres) connection string — set as DATABASE_URL on Render.
+# Use the Session pooler URI, not the direct connection (Render's free tier can't reach IPv6).
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # ---------- Config ----------
 # Set these as environment variables on Render — never hardcode real keys here.
@@ -37,13 +40,16 @@ def get_sms_client():
 
 # ---------- Database ----------
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     return conn
 
 def init_db():
+    if not DATABASE_URL:
+        print("[DB skipped - no DATABASE_URL set]")
+        return
     conn = get_db()
-    conn.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id TEXT PRIMARY KEY,
             seller TEXT NOT NULL,
@@ -58,6 +64,7 @@ def init_db():
         )
     """)
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -131,13 +138,15 @@ def create_order():
 
     order_id = uuid.uuid4().hex[:10]
     conn = get_db()
-    conn.execute(
+    cur = conn.cursor()
+    cur.execute(
         "INSERT INTO orders (id, seller, buyer_name, phone, area, items_json, amount, status, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s)",
         (order_id, seller_id, buyer_name, phone, area, json.dumps(items), amount,
          datetime.now(timezone.utc).isoformat())
     )
     conn.commit()
+    cur.close()
     conn.close()
 
     sent, info = send_confirm_sms(order_id, seller_id, buyer_name, amount)
@@ -186,23 +195,25 @@ CONFIRMED_PAGE = """
 @app.route("/confirm/<order_id>", methods=["GET", "POST"])
 def confirm_order(order_id):
     conn = get_db()
-    row = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
+    row = cur.fetchone()
 
     if not row:
-        conn.close()
+        cur.close(); conn.close()
         return render_template_string(CONFIRM_PAGE, not_found=True, already=False)
 
     if request.method == "POST":
         if row["status"] != "confirmed":
-            conn.execute(
-                "UPDATE orders SET status='confirmed', confirmed_at=? WHERE id=?",
+            cur.execute(
+                "UPDATE orders SET status='confirmed', confirmed_at=%s WHERE id=%s",
                 (datetime.now(timezone.utc).isoformat(), order_id)
             )
             conn.commit()
-        conn.close()
+        cur.close(); conn.close()
         return render_template_string(CONFIRMED_PAGE)
 
-    conn.close()
+    cur.close(); conn.close()
     if row["status"] == "confirmed":
         return render_template_string(CONFIRM_PAGE, already=True, not_found=False, confirmed_at=row["confirmed_at"])
     return render_template_string(CONFIRM_PAGE, already=False, not_found=False,
@@ -216,10 +227,10 @@ def admin_dashboard(secret):
     if secret != ADMIN_SECRET:
         return "Not found", 404
     conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM orders WHERE status='confirmed' ORDER BY confirmed_at DESC"
-    ).fetchall()
-    conn.close()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM orders WHERE status='confirmed' ORDER BY confirmed_at DESC")
+    rows = cur.fetchall()
+    cur.close(); conn.close()
 
     by_seller = {}
     for r in rows:

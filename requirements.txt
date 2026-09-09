@@ -1,3 +1,4 @@
 flask
 africastalking
 gunicorn
+psycopg2-binary
