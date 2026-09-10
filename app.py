@@ -280,6 +280,12 @@ def check_admin(req):
     supplied = req.args.get("secret") or req.headers.get("X-Admin-Secret")
     return supplied == ADMIN_SECRET
 
+@app.route("/api/verify-admin")
+def verify_admin():
+    if check_admin(request):
+        return jsonify({"valid": True})
+    return jsonify({"valid": False}), 401
+
 @app.route("/api/categories/<seller_id>")
 def get_categories(seller_id):
     if seller_id not in SELLERS:
