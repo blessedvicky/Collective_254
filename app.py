@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import requests
 import psycopg2
 import psycopg2.extras
 from datetime import datetime, timezone
@@ -11,6 +12,11 @@ app = Flask(__name__)
 # Supabase (or any Postgres) connection string — set as DATABASE_URL on Render.
 # Use the Session pooler URI, not the direct connection (Render's free tier can't reach IPv6).
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# Supabase Storage — for uploaded product photos. Separate from DATABASE_URL.
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")  # e.g. https://xxxx.supabase.co
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")  # "service_role" or new-style "secret" key — server-side only, never sent to the browser
+PHOTOS_BUCKET = "product-photos"
 
 # ---------- Config ----------
 # Set these as environment variables on Render — never hardcode real keys here.
@@ -279,6 +285,45 @@ def get_categories(seller_id):
     if seller_id not in SELLERS:
         return jsonify({"error": "unknown seller"}), 404
     return jsonify(CATEGORY_OPTIONS.get(seller_id, []))
+
+
+ALLOWED_PHOTO_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+
+@app.route("/api/upload-photo/<seller_id>", methods=["POST", "OPTIONS"])
+def upload_photo(seller_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    if seller_id not in SELLERS:
+        return jsonify({"error": "unknown seller"}), 404
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 401
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        return jsonify({"error": "photo storage not configured yet"}), 500
+
+    if "photo" not in request.files:
+        return jsonify({"error": "no photo file in request"}), 400
+    file = request.files["photo"]
+    content_type = file.content_type
+    ext = ALLOWED_PHOTO_TYPES.get(content_type)
+    if not ext:
+        return jsonify({"error": "only jpg, png, or webp images are allowed"}), 400
+
+    filename = f"{seller_id}/{uuid.uuid4().hex}.{ext}"
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{PHOTOS_BUCKET}/{filename}"
+    resp = requests.post(
+        upload_url,
+        headers={
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": content_type,
+        },
+        data=file.read(),
+    )
+    if resp.status_code not in (200, 201):
+        return jsonify({"error": f"upload failed: {resp.text}"}), 502
+
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{PHOTOS_BUCKET}/{filename}"
+    return jsonify({"photo_url": public_url})
 
 @app.route("/api/products/<seller_id>", methods=["GET", "POST", "OPTIONS"])
 def products_collection(seller_id):
