@@ -103,6 +103,9 @@ def init_db():
             updated_at TEXT
         )
     """)
+    # Gallery support — several photos per shoe (different angles), not per-color.
+    # photo_url is kept in sync with photos[0] so anything still reading the old single field still works.
+    cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS photos TEXT")
     conn.commit()
     cur.close()
     conn.close()
@@ -137,7 +140,7 @@ def send_sms(seller_id, message):
 def add_cors_headers(resp):
     # The shop lives on GitHub Pages, a different origin, so the browser needs these to allow the request.
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return resp
 
@@ -348,6 +351,12 @@ def products_collection(seller_id):
         for r in rows:
             r["sizes"] = [s for s in (r["sizes"] or "").split(",") if s]
             r["colors"] = [c for c in (r["colors"] or "").split(",") if c]
+            # Backward-compat: older items only have a single photo_url — show it as a
+            # one-photo gallery so it can still be opened and extended in the admin panel.
+            if r.get("photos"):
+                r["photos"] = json.loads(r["photos"])
+            else:
+                r["photos"] = [r["photo_url"]] if r.get("photo_url") else []
         return jsonify(rows)
 
     # POST — create a new product. Admin-only.
@@ -362,7 +371,7 @@ def products_collection(seller_id):
     sizes = data.get("sizes", [])
     colors = data.get("colors", [])
     description = data.get("description", "")
-    photo_url = data.get("photo_url", "")
+    photos = data.get("photos", [])
     in_stock = bool(data.get("in_stock", True))
 
     valid_categories = [c["id"] for c in CATEGORY_OPTIONS.get(seller_id, [])]
@@ -376,10 +385,10 @@ def products_collection(seller_id):
     product_id = uuid.uuid4().hex[:10]
     now = datetime.now(timezone.utc).isoformat()
     cur.execute(
-        "INSERT INTO products (id, seller, name, category, price, sizes, colors, description, photo_url, in_stock, created_at, updated_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        "INSERT INTO products (id, seller, name, category, price, sizes, colors, description, photo_url, photos, in_stock, created_at, updated_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (product_id, seller_id, name, category, price, ",".join(sizes), ",".join(colors),
-         description, photo_url, in_stock, now, now)
+         description, (photos[0] if photos else ""), json.dumps(photos), in_stock, now, now)
     )
     conn.commit()
     cur.close(); conn.close()
@@ -412,7 +421,7 @@ def products_item(seller_id, product_id):
         return jsonify({"error": f"category must be one of {valid_categories}"}), 400
 
     fields, values = [], []
-    for key in ["name", "category", "price", "description", "photo_url", "in_stock"]:
+    for key in ["name", "category", "price", "description", "in_stock"]:
         if key in data:
             fields.append(f"{key}=%s")
             values.append(data[key])
@@ -420,6 +429,10 @@ def products_item(seller_id, product_id):
         fields.append("sizes=%s"); values.append(",".join(data["sizes"]))
     if "colors" in data:
         fields.append("colors=%s"); values.append(",".join(data["colors"]))
+    if "photos" in data:
+        photos = data["photos"]
+        fields.append("photos=%s"); values.append(json.dumps(photos))
+        fields.append("photo_url=%s"); values.append(photos[0] if photos else "")
     fields.append("updated_at=%s"); values.append(datetime.now(timezone.utc).isoformat())
 
     if not fields:
