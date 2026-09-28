@@ -106,6 +106,14 @@ def init_db():
     # Gallery support — several photos per shoe (different angles), not per-color.
     # photo_url is kept in sync with photos[0] so anything still reading the old single field still works.
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS photos TEXT")
+    # Discount pricing — original_price shown struck-through with a savings badge when set and higher than price.
+    cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS original_price INTEGER")
+    # Structured specs shown on the product page — all optional.
+    cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS material TEXT")
+    cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS style TEXT")
+    cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS closure TEXT")
+    # "Good for" tags — short badges like Everyday wear, Casual outings. Stored as a JSON array.
+    cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS tags TEXT")
     conn.commit()
     cur.close()
     conn.close()
@@ -357,6 +365,7 @@ def products_collection(seller_id):
                 r["photos"] = json.loads(r["photos"])
             else:
                 r["photos"] = [r["photo_url"]] if r.get("photo_url") else []
+            r["tags"] = json.loads(r["tags"]) if r.get("tags") else []
         return jsonify(rows)
 
     # POST — create a new product. Admin-only.
@@ -368,11 +377,16 @@ def products_collection(seller_id):
     name = (data.get("name") or "").strip()
     category = data.get("category")
     price = data.get("price")
+    original_price = data.get("original_price") or None
     sizes = data.get("sizes", [])
     colors = data.get("colors", [])
     description = data.get("description", "")
     photos = data.get("photos", [])
     in_stock = bool(data.get("in_stock", True))
+    material = data.get("material") or None
+    style = data.get("style") or None
+    closure = data.get("closure") or None
+    tags = data.get("tags", [])
 
     valid_categories = [c["id"] for c in CATEGORY_OPTIONS.get(seller_id, [])]
     if not name or not price:
@@ -385,10 +399,10 @@ def products_collection(seller_id):
     product_id = uuid.uuid4().hex[:10]
     now = datetime.now(timezone.utc).isoformat()
     cur.execute(
-        "INSERT INTO products (id, seller, name, category, price, sizes, colors, description, photo_url, photos, in_stock, created_at, updated_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-        (product_id, seller_id, name, category, price, ",".join(sizes), ",".join(colors),
-         description, (photos[0] if photos else ""), json.dumps(photos), in_stock, now, now)
+        "INSERT INTO products (id, seller, name, category, price, original_price, sizes, colors, description, photo_url, photos, in_stock, material, style, closure, tags, created_at, updated_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (product_id, seller_id, name, category, price, original_price, ",".join(sizes), ",".join(colors),
+         description, (photos[0] if photos else ""), json.dumps(photos), in_stock, material, style, closure, json.dumps(tags), now, now)
     )
     conn.commit()
     cur.close(); conn.close()
@@ -421,10 +435,10 @@ def products_item(seller_id, product_id):
         return jsonify({"error": f"category must be one of {valid_categories}"}), 400
 
     fields, values = [], []
-    for key in ["name", "category", "price", "description", "in_stock"]:
+    for key in ["name", "category", "price", "original_price", "description", "in_stock", "material", "style", "closure"]:
         if key in data:
             fields.append(f"{key}=%s")
-            values.append(data[key])
+            values.append(data[key] if data[key] != "" else None)
     if "sizes" in data:
         fields.append("sizes=%s"); values.append(",".join(data["sizes"]))
     if "colors" in data:
@@ -433,6 +447,8 @@ def products_item(seller_id, product_id):
         photos = data["photos"]
         fields.append("photos=%s"); values.append(json.dumps(photos))
         fields.append("photo_url=%s"); values.append(photos[0] if photos else "")
+    if "tags" in data:
+        fields.append("tags=%s"); values.append(json.dumps(data["tags"]))
     fields.append("updated_at=%s"); values.append(datetime.now(timezone.utc).isoformat())
 
     if not fields:
