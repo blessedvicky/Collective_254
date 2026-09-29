@@ -4,7 +4,8 @@ import json
 import requests
 import psycopg2
 import psycopg2.extras
-from datetime import datetime, timezone
+import hashlib
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify, render_template_string
 
 app = Flask(__name__)
@@ -114,6 +115,35 @@ def init_db():
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS closure TEXT")
     # "Good for" tags — short badges like Everyday wear, Casual outings. Stored as a JSON array.
     cur.execute("ALTER TABLE products ADD COLUMN IF NOT EXISTS tags TEXT")
+
+    # Offers — announcements with a real start/end time, scoped to the whole shop, a category, or specific shoes.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS offers (
+            id TEXT PRIMARY KEY,
+            seller TEXT NOT NULL,
+            title TEXT NOT NULL,
+            message TEXT,
+            starts_at TEXT NOT NULL,
+            ends_at TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            category TEXT,
+            product_ids TEXT,
+            created_at TEXT
+        )
+    """)
+    # Customer reviews — open posting, moderated after the fact by deleting from the admin panel.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reviews (
+            id TEXT PRIMARY KEY,
+            seller TEXT NOT NULL,
+            product_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            rating INTEGER NOT NULL,
+            comment TEXT,
+            ip_hash TEXT,
+            created_at TEXT
+        )
+    """)
     conn.commit()
     cur.close()
     conn.close()
@@ -422,6 +452,7 @@ def products_item(seller_id, product_id):
 
     if request.method == "DELETE":
         cur.execute("DELETE FROM products WHERE id=%s AND seller=%s", (product_id, seller_id))
+        cur.execute("DELETE FROM reviews WHERE product_id=%s AND seller=%s", (product_id, seller_id))
         conn.commit()
         cur.close(); conn.close()
         return jsonify({"status": "deleted"})
@@ -460,6 +491,177 @@ def products_item(seller_id, product_id):
     conn.commit()
     cur.close(); conn.close()
     return jsonify({"status": "updated"})
+
+
+# ---------- Offers (announcements with a real countdown) ----------
+def parse_iso(value):
+    """Parse an ISO datetime string into an aware UTC datetime, or None if it isn't valid."""
+    try:
+        d = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc)
+
+@app.route("/api/offers/<seller_id>", methods=["GET", "POST", "OPTIONS"])
+def offers_collection(seller_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    if seller_id not in SELLERS:
+        return jsonify({"error": "unknown seller"}), 404
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    if request.method == "GET":
+        cur.execute("SELECT * FROM offers WHERE seller=%s ORDER BY starts_at", (seller_id,))
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+        for r in rows:
+            r["product_ids"] = json.loads(r["product_ids"]) if r.get("product_ids") else []
+        return jsonify(rows)
+
+    if not check_admin(request):
+        cur.close(); conn.close()
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True, silent=True) or {}
+    title = (data.get("title") or "").strip()[:80]
+    message = (data.get("message") or "").strip()[:200]
+    starts = parse_iso(data.get("starts_at"))
+    ends = parse_iso(data.get("ends_at"))
+    scope = data.get("scope")
+    category = data.get("category") if scope == "category" else None
+    product_ids = data.get("product_ids", []) if scope == "products" else []
+
+    valid_categories = [c["id"] for c in CATEGORY_OPTIONS.get(seller_id, [])]
+    error = None
+    if not title:
+        error = "an offer needs a title"
+    elif not starts or not ends:
+        error = "start and end times are required"
+    elif ends <= starts:
+        error = "the end time must be after the start time"
+    elif scope not in ("all", "category", "products"):
+        error = "scope must be all, category, or products"
+    elif scope == "category" and category not in valid_categories:
+        error = f"category must be one of {valid_categories}"
+    elif scope == "products" and (not isinstance(product_ids, list) or not product_ids):
+        error = "pick at least one shoe for this offer"
+    if error:
+        cur.close(); conn.close()
+        return jsonify({"error": error}), 400
+
+    offer_id = uuid.uuid4().hex[:10]
+    cur.execute(
+        "INSERT INTO offers (id, seller, title, message, starts_at, ends_at, scope, category, product_ids, created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        (offer_id, seller_id, title, message, starts.isoformat(), ends.isoformat(), scope, category,
+         json.dumps(product_ids), datetime.now(timezone.utc).isoformat())
+    )
+    conn.commit()
+    cur.close(); conn.close()
+    return jsonify({"id": offer_id, "status": "created"})
+
+@app.route("/api/offers/<seller_id>/<offer_id>", methods=["DELETE", "OPTIONS"])
+def offers_item(seller_id, offer_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    if seller_id not in SELLERS:
+        return jsonify({"error": "unknown seller"}), 404
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 401
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM offers WHERE id=%s AND seller=%s", (offer_id, seller_id))
+    conn.commit()
+    cur.close(); conn.close()
+    return jsonify({"status": "deleted"})
+
+
+# ---------- Reviews (anyone can post; admin can delete) ----------
+def client_ip_hash():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    ip = forwarded.split(",")[0].strip() if forwarded else (request.remote_addr or "")
+    return hashlib.sha256((ip + ADMIN_SECRET).encode()).hexdigest()[:16]
+
+@app.route("/api/reviews/<seller_id>", methods=["GET", "POST", "OPTIONS"])
+def reviews_collection(seller_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    if seller_id not in SELLERS:
+        return jsonify({"error": "unknown seller"}), 404
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    if request.method == "GET":
+        cur.execute(
+            "SELECT id, product_id, name, rating, comment, created_at FROM reviews "
+            "WHERE seller=%s ORDER BY created_at DESC LIMIT 1000", (seller_id,)
+        )
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+        return jsonify(rows)
+
+    data = request.get_json(force=True, silent=True) or {}
+    if data.get("website"):
+        # Hidden spam-trap field: real people never fill it in. Pretend it worked so bots don't adapt.
+        cur.close(); conn.close()
+        return jsonify({"status": "created"})
+
+    product_id = data.get("product_id")
+    name = (data.get("name") or "").strip()[:40]
+    comment = (data.get("comment") or "").strip()[:500]
+    try:
+        rating = int(data.get("rating"))
+    except (TypeError, ValueError):
+        rating = 0
+
+    if not (1 <= rating <= 5):
+        cur.close(); conn.close()
+        return jsonify({"error": "please choose a star rating from 1 to 5"}), 400
+    if not name:
+        cur.close(); conn.close()
+        return jsonify({"error": "please add your name"}), 400
+
+    cur.execute("SELECT 1 AS ok FROM products WHERE id=%s AND seller=%s", (product_id, seller_id))
+    if not cur.fetchone():
+        cur.close(); conn.close()
+        return jsonify({"error": "that shoe no longer exists"}), 404
+
+    ip_hash = client_ip_hash()
+    since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    cur.execute("SELECT COUNT(*) AS n FROM reviews WHERE ip_hash=%s AND created_at > %s", (ip_hash, since))
+    if cur.fetchone()["n"] >= 5:
+        cur.close(); conn.close()
+        return jsonify({"error": "you've posted a few reviews already — please try again later"}), 429
+
+    review_id = uuid.uuid4().hex[:10]
+    cur.execute(
+        "INSERT INTO reviews (id, seller, product_id, name, rating, comment, ip_hash, created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+        (review_id, seller_id, product_id, name, rating, comment, ip_hash, datetime.now(timezone.utc).isoformat())
+    )
+    conn.commit()
+    cur.close(); conn.close()
+    return jsonify({"id": review_id, "status": "created"})
+
+@app.route("/api/reviews/<seller_id>/<review_id>", methods=["DELETE", "OPTIONS"])
+def reviews_item(seller_id, review_id):
+    if request.method == "OPTIONS":
+        return "", 204
+    if seller_id not in SELLERS:
+        return jsonify({"error": "unknown seller"}), 404
+    if not check_admin(request):
+        return jsonify({"error": "unauthorized"}), 401
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM reviews WHERE id=%s AND seller=%s", (review_id, seller_id))
+    conn.commit()
+    cur.close(); conn.close()
+    return jsonify({"status": "deleted"})
 
 
 @app.route("/admin/<secret>")
