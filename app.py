@@ -128,6 +128,7 @@ def init_db():
             scope TEXT NOT NULL,
             category TEXT,
             product_ids TEXT,
+            discount_percent INTEGER,
             created_at TEXT
         )
     """)
@@ -534,6 +535,11 @@ def offers_collection(seller_id):
     scope = data.get("scope")
     category = data.get("category") if scope == "category" else None
     product_ids = data.get("product_ids", []) if scope == "products" else []
+    discount_raw = data.get("discount_percent")
+    try:
+        discount_percent = int(discount_raw) if discount_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        discount_percent = -1  # forces the validation error below rather than silently dropping a bad value
 
     valid_categories = [c["id"] for c in CATEGORY_OPTIONS.get(seller_id, [])]
     error = None
@@ -549,16 +555,18 @@ def offers_collection(seller_id):
         error = f"category must be one of {valid_categories}"
     elif scope == "products" and (not isinstance(product_ids, list) or not product_ids):
         error = "pick at least one shoe for this offer"
+    elif discount_percent is not None and not (1 <= discount_percent <= 90):
+        error = "discount must be between 1 and 90 percent"
     if error:
         cur.close(); conn.close()
         return jsonify({"error": error}), 400
 
     offer_id = uuid.uuid4().hex[:10]
     cur.execute(
-        "INSERT INTO offers (id, seller, title, message, starts_at, ends_at, scope, category, product_ids, created_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+        "INSERT INTO offers (id, seller, title, message, starts_at, ends_at, scope, category, product_ids, discount_percent, created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (offer_id, seller_id, title, message, starts.isoformat(), ends.isoformat(), scope, category,
-         json.dumps(product_ids), datetime.now(timezone.utc).isoformat())
+         json.dumps(product_ids), discount_percent, datetime.now(timezone.utc).isoformat())
     )
     conn.commit()
     cur.close(); conn.close()
