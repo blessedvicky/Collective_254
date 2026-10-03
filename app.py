@@ -132,6 +132,9 @@ def init_db():
             created_at TEXT
         )
     """)
+    # Needed because the offers table above already existed before discount_percent was added —
+    # CREATE TABLE IF NOT EXISTS is a no-op on a table that's already there, so this is required too.
+    cur.execute("ALTER TABLE offers ADD COLUMN IF NOT EXISTS discount_percent INTEGER")
     # Customer reviews — open posting, moderated after the fact by deleting from the admin panel.
     cur.execute("""
         CREATE TABLE IF NOT EXISTS reviews (
